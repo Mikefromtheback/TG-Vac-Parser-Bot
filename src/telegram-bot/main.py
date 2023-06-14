@@ -303,3 +303,4 @@ async def print_tg_exc(error):
 if __name__ == "__main__":
     asyncio.get_event_loop_policy().get_event_loop().create_task(db.initialize())
     executor.start_polling(dispatcher=dp, skip_updates=True)
+    
