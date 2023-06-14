@@ -1,60 +1,29 @@
+import asyncio
 import logging
-import aiogram
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import StatesGroup, State
+from aiogram.utils.exceptions import TelegramAPIError
 import config
-from bd import db
+from bd import DbInterface, datetime
 from aiogram import executor, Bot, types, Dispatcher
 from keyboards import *
-from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.token)
 storage = MemoryStorage()
 dp = Dispatcher(bot=bot, storage=storage)
+db = DbInterface()
 
 
 class RegistrationProcess(StatesGroup):  # FSM
     city = State()
-    remote = State()
+    allow_remote = State()
     grade = State()
+    allow_no_grade = State()
     skills = State()
-    salary = State()
-
-
-@dp.message_handler(commands="menu")
-async def start(message: types.Message):
-    if db.check_user(message.from_user.id):
-        await message.answer(text=f"Привет, {message.from_user.full_name}! Что ты хочешь сделать?",
-                             reply_markup=menu_board)
-    else:
-        await message.answer(
-            text="Привет! Я помогу тебе найти вакансии в сфере IT. Ответь на несколько вопросов, чтобы начать получать подходящие для тебя вакансии.",
-            reply_markup=register_board)
-
-
-@dp.callback_query_handler(lambda c: c.data == "check")
-async def check_vacancies(c: types.CallbackQuery):
-    user_data = db.get_user_data(c.from_user.id)
-    latest_time = user_data[6]
-    parsed_vacancies = db.get_vacancies(db.get_user_data(c.from_user.id))
-    if not parsed_vacancies:
-        await c.answer()
-        await bot.send_message(c.from_user.id, text="К сожалению, новых вакансий пока что нет.",
-                               reply_markup=delete_board)
-    else:
-        await c.answer()
-        for vacancy in parsed_vacancies:
-            temp_link_board = InlineKeyboardMarkup()
-            link_button = InlineKeyboardButton(text="Открыть в браузере", url=vacancy[3])
-            temp_link_board.add(link_button)
-            temp_link_board.add(delete_button)
-            await bot.send_message(c.from_user.id,
-                                   text=f"Найдена вакансия!\n\nКомпания:{vacancy[1]}\n\nОписание: {vacancy[2]}",
-                                   reply_markup=temp_link_board)
-            latest_time = max(latest_time, vacancy[4])
-        db.update_user_time(c.from_user.id, latest_time)
+    min_salary = State()
+    allow_no_salary = State()
 
 
 @dp.callback_query_handler(lambda c: c.data == "delete")
@@ -62,124 +31,275 @@ async def delete_message(c):
     await c.message.delete()
 
 
-@dp.callback_query_handler(lambda c: c.data == "forget")
-async def forget(c: types.CallbackQuery):
-    db.delete_user(c.from_user.id)
+@dp.callback_query_handler(lambda c: c.data == "back", state=RegistrationProcess.allow_remote)
+async def back_from_process_remote(c: types.CallbackQuery):
     await c.answer()
-    await bot.send_message(c.from_user.id, "Анкета удалена. Ты можешь создать новую.", reply_markup=register_board)
-
-
-@dp.callback_query_handler(lambda c: c.data == "register")
-async def start_registration(c: types.CallbackQuery):
     await RegistrationProcess.city.set()
-    await c.answer()
     await bot.send_message(c.from_user.id,
-                           "Вакансии из какого города тебе интересны? Если хочешь работать только удалённо, нажми на соответствующую кнопку.",
+                           "Напиши через запятую, вакансии из каких городов тебе интересны. Если хочешь работать "
+                           "только удалённо, нажми на соответствующую кнопку.",
                            reply_markup=remote_board)
 
 
-@dp.message_handler(lambda message: len(message.text) > 20, state=RegistrationProcess.city)
-async def process_bad_city(message: types.Message):
-    return await message.reply("Напиши название города ещё раз ☹️",
-                               reply_markup=remote_board)
+@dp.callback_query_handler(lambda c: c.data == "back", state=RegistrationProcess.grade)
+async def back_from_grade(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
+    async with state.proxy() as data:
+        if not data.get("city", None):
+            await RegistrationProcess.city.set()
+            await bot.send_message(c.from_user.id,
+                                   "Напиши через запятую, вакансии из каких городов тебе интересны. Если хочешь "
+                                   "работать только удалённо, нажми на соответствующую кнопку.",
+                                   reply_markup=remote_board)
+        else:
+            await RegistrationProcess.allow_remote.set()
+            await bot.send_message(c.from_user.id,
+                                   text="Выбери, хочешь ли ты видеть вакансии с удалённой работой, и нажми на кнопку.",
+                                   reply_markup=yesno_board)
 
 
-@dp.message_handler(lambda message: message.text == "Хочу только удалённо", state=RegistrationProcess.city)
-async def get_city(message: types.Message, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data == "back", state=RegistrationProcess.allow_no_grade)
+async def back_from_allow_no_grade(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
     await RegistrationProcess.grade.set()
-    await state.update_data(city="NULL")
-    await state.update_data(remote=True)
-    await message.reply("Я запомнил. Теперь выбери, на какой ты претендуешь грейд.",
-                        reply_markup=grade_board)
+    grades_chosen = (await state.get_data())["grade"]
+    await bot.send_message(c.from_user.id, text="Выбери желаемые грейды.",
+                           reply_markup=await grade_board(grades_chosen))
+
+
+@dp.callback_query_handler(lambda c: c.data == "back", state=RegistrationProcess.skills)
+async def back_from_skills(c: types.CallbackQuery):
+    await c.answer()
+    await RegistrationProcess.allow_no_grade.set()
+    await bot.send_message(c.from_user.id,
+                           text="Выбери, показывать ли вакансии без указанного грейда - их немного, но они есть.",
+                           reply_markup=yesno_board)
+
+
+@dp.callback_query_handler(lambda c: c.data == "back", state=RegistrationProcess.min_salary)
+async def back_from_salary(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
+    await RegistrationProcess.skills.set()
+    skills_chosen = (await state.get_data())["grade"]
+    await bot.send_message(chat_id=c.from_user.id,
+                           text="Выбери интересующие тебя специализации. Ты можешь дополнительно написать свои через запятую.",
+                           reply_markup=await skills_board(skills_chosen))
+
+
+@dp.callback_query_handler(lambda c: c.data == "back", state=RegistrationProcess.allow_no_salary)
+async def back_from_allow_no_salary(c: types.CallbackQuery):
+    await RegistrationProcess.min_salary.set()
+    await bot.send_message(chat_id=c.from_user.id,
+                           text="Напиши минимальную зарплату в долларах для показа вакансии.")
+
+
+@dp.message_handler(commands=["menu", "start"], state=None)
+async def start(message: types.Message):
+    user_status = await db.check_user(message.from_user.id)
+    match user_status:
+        case 0:
+            return await message.answer(text=f"Привет, {message.from_user.full_name}! Что ты хочешь сделать?",
+                                        reply_markup=menu_board)
+        case 1:
+            return await message.answer(
+                text="Я помогу тебе найти вакансии в сфере IT. Ответь на несколько вопросов, чтобы начать получать подходящие для тебя вакансии.",
+                reply_markup=register_board)
+        case -1:
+            return
+
+
+@dp.callback_query_handler(lambda c: c.data == "check", state=None)
+async def check_vacancies(c: types.CallbackQuery):
+    parsed_vacancies = await db.get_vacancies(c.from_user.id)
+    await c.answer()
+    if not parsed_vacancies:
+        await bot.send_message(c.from_user.id, text="К сожалению, новых вакансий пока что нет.",
+                               reply_markup=delete_board)
+    else:
+        latest_time = datetime.datetime(2007, 1, 1, tzinfo=datetime.timezone.utc)
+        for vacancy in parsed_vacancies:
+            temp_link_board = InlineKeyboardMarkup()
+            link_button = InlineKeyboardButton(text="Открыть в браузере", url=vacancy[2])
+            temp_link_board.add(link_button)
+            temp_link_board.add(delete_button)
+            await bot.send_message(c.from_user.id,
+                                   text=f"Найдена вакансия!\n\nКомпания:{vacancy[0]}\n\nОписание: {vacancy[1]}",
+                                   reply_markup=temp_link_board)
+            latest_time = max(latest_time, vacancy[3])
+        await db.update_user_time(c.from_user.id, latest_time)
+
+
+@dp.callback_query_handler(lambda c: c.data == "forget", state=None)
+async def forget(c: types.CallbackQuery):
+    if await db.delete_user(c.from_user.id):
+        await c.answer()
+        await bot.send_message(c.from_user.id, "Анкета удалена. Ты можешь создать новую.", reply_markup=register_board)
+    else:
+        await c.answer()
+        await bot.send_message(c.from_user.id, "Произошла ошибка при удалении анкеты. Пожалуйста, попробуй снова.")
+
+
+@dp.callback_query_handler(lambda c: c.data == "register", state=None)
+async def ask_city(c: types.CallbackQuery, state: FSMContext):
+    await c.message.delete()
+    async with state.proxy() as data:
+        data["grade"] = set()
+        data["skills"] = set()
+    await RegistrationProcess.city.set()
+    await bot.send_message(c.from_user.id,
+                           "Напиши через запятую, из каких городов тебе интересны вакансии. Если хочешь работать только удалённо, нажми на соответствующую кнопку.",
+                           reply_markup=remote_board)
 
 
 @dp.message_handler(state=RegistrationProcess.city)
-async def get_city(message: types.Message, state: FSMContext):
-    await RegistrationProcess.next()
-    await state.update_data(city=message.text)
-    return await message.reply(
-        "Я запомнил. Выбери, хочешь ли ты видеть вакансии с удалённой работой, и нажми на кнопку.",
-        reply_markup=yesno_board)
+async def process_city(message: types.Message, state: FSMContext):
+    await state.update_data(city=[word.strip() for word in message.text.split(",")])
+    await RegistrationProcess.allow_remote.set()
+    await message.reply("Выбери, хочешь ли ты видеть вакансии с удалённой работой, и нажми на кнопку.",
+                        reply_markup=yesno_board)
 
 
-@dp.message_handler(state=RegistrationProcess.remote)
-async def process_remote(message: types.Message, state: FSMContext):
-    if (message.text != "Да" and message.text != "Нет"):
-        return await message.reply("Пожалуйста, выбери 'Да' или 'Нет'.")
-    if (message.text == "Да"):
-        await state.update_data(remote=True)
-    else:
-        await state.update_data(remote=False)
+@dp.callback_query_handler(lambda c: c.data == "remote_only", state=RegistrationProcess.city)
+async def process_city_only_remote(c: types.CallbackQuery, state: FSMContext):
+    await c.message.delete()
     await RegistrationProcess.grade.set()
-    await message.reply("Хорошо. Теперь выбери, на какой ты претендуешь грейд.",
-                        reply_markup=grade_board)
+    await state.update_data(city=None)
+    await state.update_data(allow_remote=True)
+    grades_chosen = (await state.get_data())["grade"]
+    await bot.send_message(c.from_user.id, text="Я запомнил. Теперь выбери, на какой ты претендуешь грейд.",
+                           reply_markup=await grade_board(grades_chosen))
 
 
-@dp.message_handler(lambda message: message.text not in ["Junior", "Middle", "Senior", "Lead"],
-                    state=RegistrationProcess.grade)
-async def process_bad_grade(message: types.Message):
-    return await message.reply("Пожалуйста, выбери грейд из данных вариантов ☹️")
+@dp.callback_query_handler(state=RegistrationProcess.allow_remote)
+async def process_remote(c: types.CallbackQuery, state: FSMContext):
+    await c.message.delete()
+    await state.update_data(allow_remote=(c.data == "yes"))
+    await RegistrationProcess.grade.set()
+    grades_chosen = (await state.get_data())["grade"]
+    await bot.send_message(chat_id=c.from_user.id, text="Хорошо. Теперь выбери грейды для поиска.",
+                           reply_markup=await grade_board(grades_chosen))
 
 
-@dp.message_handler(state=RegistrationProcess.grade)  # skill board
-async def process_grade(message: types.Message, state: FSMContext):
-    await RegistrationProcess.skills.set()
-    await state.update_data(grade=message.text)
-    await message.reply("Грейд выбран. Выбери интересующие тебя технологии и нажми продолжить.",
-                        reply_markup=aiogram.types.ReplyKeyboardRemove())
+@dp.callback_query_handler(lambda c: c.data == "continue", state=RegistrationProcess.grade)
+async def process_grade(c: types.CallbackQuery, state: FSMContext):
+    # async with state.proxy() as data:
+    #    if not data["grade"]:
+    if not (await state.get_data())["grade"]:
+        return await c.answer(text="Ты ничего не выбрал!")
+    await c.message.delete()
+    await RegistrationProcess.allow_no_grade.set()
+    await bot.send_message(chat_id=c.from_user.id,
+                           text="Выбери, показывать ли вакансии без указанного грейда - их немного, но они есть.",
+                           reply_markup=yesno_board)
+
+
+@dp.callback_query_handler(state=RegistrationProcess.grade)
+async def process_one_grade(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
     async with state.proxy() as data:
-        data['chosen_skills'] = set()
-    await bot.send_message(message.from_user.id, text="Можно выбрать столько, сколько хочешь.",
-                           reply_markup=skills_board)
+        if c.data in data["grade"]:
+            data["grade"].discard(c.data)
+        else:
+            data["grade"].add(c.data)
+        grades_chosen = data["grade"]
+    await bot.edit_message_reply_markup(chat_id=c.from_user.id, message_id=c.message.message_id,
+                                        reply_markup=await grade_board(grades_chosen))
 
 
-@dp.callback_query_handler(lambda c: c.data == "askforsalary", state=RegistrationProcess.skills)
+@dp.callback_query_handler(lambda c: c.data == "yes" or c.data == "no",
+                           state=RegistrationProcess.allow_no_grade)
+async def process_allow_no_grade(c: types.CallbackQuery, state: FSMContext):
+    await c.message.delete()
+    await state.update_data(allow_no_grade=(c.data == "yes"))
+    await RegistrationProcess.skills.set()
+    skills_chosen = (await state.get_data())["skills"]
+    await bot.send_message(chat_id=c.from_user.id,
+                           text="Выбери интересующие тебя специализации. Ты можешь дополнительно написать свои через запятую.",
+                           reply_markup=await skills_board(skills_chosen))
+
+
+@dp.callback_query_handler(lambda c: c.data == "continue", state=RegistrationProcess.skills)
 async def process_skills(c: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
-        if not data['chosen_skills']:
+        if not data["skills"]:
             return await c.answer(text="Ты ничего не выбрал!")
-        await state.update_data(skills=list(data['chosen_skills']))
-    await RegistrationProcess.salary.set()
-    await c.answer()
-    await bot.send_message(c.from_user.id,
-                           text="Хорошо! Последний шаг: если хочешь, укажи числом минимальную зп в долларах, и я не буду присылать вакансии с зп меньше неё и без указанной зарплаты. Если ты напишешь 0, то я буду присылать все вакансии, даже без указанной зп.")
+    await RegistrationProcess.min_salary.set()
+    await c.message.delete()
+    await bot.send_message(chat_id=c.from_user.id,
+                           text="Навыки сохранены. Напиши минимальную зарплату в долларах для показа вакансии.",
+                           reply_markup=back_board)
 
 
 @dp.callback_query_handler(state=RegistrationProcess.skills)
 async def collecting_skills(c: types.CallbackQuery, state: FSMContext):
-    refreshed_skills_board = InlineKeyboardMarkup(resize_keyboard=True, row_width=3)
     async with state.proxy() as data:
-        if c.data in data['chosen_skills']:
-            data['chosen_skills'].remove(c.data)
+        if c.data in data["skills"]:
+            data["skills"].discard(c.data)
         else:
-            data['chosen_skills'].add(c.data)
-        for skill in skills_available:
-            if skill.callback_data in data['chosen_skills']:
-                refreshed_skills_board.add(
-                    InlineKeyboardButton(text=skill.text + " 🟢", callback_data=skill.callback_data))
-            else:
-                refreshed_skills_board.add(skill)
-    refreshed_skills_board.add(continue_button)
+            data["skills"].add(c.data)
+        chosen_skills = data["skills"]
     await bot.edit_message_reply_markup(chat_id=c.from_user.id, message_id=c.message.message_id,
-                                        reply_markup=refreshed_skills_board)
+                                        reply_markup=await skills_board(chosen_skills))
+
+
+@dp.message_handler(state=RegistrationProcess.skills)
+async def process_additional_skills(message: types.Message, state: FSMContext):
+    await state.update_data(additional_skills=[word.strip() for word in message.text.split(",")])
+    await message.reply(text="Я запомнил их и буду использовать при поиске."
+                             " Если хочешь изменить этот список, просто отправь новый.")
 
 
 @dp.message_handler(lambda message: len(message.text) > 10 or not message.text.isdigit(),
-                    state=RegistrationProcess.salary)
+                    state=RegistrationProcess.min_salary)
 async def process_bad_salary(message: types.Message):
-    return await message.reply("Напиши число еще раз ☹️")
+    return await message.reply(text="Напиши число еще раз ☹", protect_content=True)
 
 
-@dp.message_handler(state=RegistrationProcess.salary)
+@dp.message_handler(state=RegistrationProcess.min_salary)
 async def process_salary(message: types.Message, state: FSMContext):
-    await state.update_data(salary=int(message.text))
+    await state.update_data(min_salary=int(message.text))
+    await RegistrationProcess.allow_no_salary.set()
+    await bot.send_message(message.chat.id,
+                           text="Хорошо. Показывать вакансии, в которых не указана зарплата? Таких много.",
+                           reply_markup=yesno_board)
+
+
+@dp.callback_query_handler(lambda c: c.data in ["yes", "no"], state=RegistrationProcess.allow_no_salary)
+async def process_allow_no_salary(c: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
-        db.add_user(message.from_user.id, data['city'], data['remote'],
-                    data['grade'], data['skills'], data['salary'])
-    await bot.send_message(message.chat.id, text="Все готово, теперь я буду искать для тебя вакансии!",
-                           reply_markup=InlineKeyboardMarkup().add(check_button))
+        data["allow_no_salary"] = (c.data == "yes")
+        data["skills"].discard("switch_board")
+        if not await db.add_user(user_id=c.from_user.id,
+                                 city=data["city"],
+                                 allow_remote=data["allow_remote"],
+                                 grade=data["grade"],
+                                 allow_no_grade=data["allow_no_grade"],
+                                 skills=data["skills"],
+                                 additional_skills=data.get("additional_skills", []),
+                                 min_salary=data["min_salary"],
+                                 allow_no_salary=data["allow_no_salary"]):
+            return await bot.send_message(chat_id=c.from_user.id,
+                                          text="Возникла ошибка при сохранении анкеты. Пожалуйста, попробуй снова.")
+    await c.message.delete()
     await state.finish()
+    await bot.send_message(chat_id=c.from_user.id,
+                           text="Все готово, теперь ты можешь искать вакансии!",
+                           reply_markup=InlineKeyboardMarkup().add(check_button))
+
+
+@dp.callback_query_handler(state="*")
+async def process_foo_callback(c: types.CallbackQuery):
+    await c.answer()
+    # user нажал кнопку из устаревшего сообщения
+
+
+@dp.errors_handler(exception=TelegramAPIError)
+async def print_tg_exc(error):
+    print("[INFO] Telegram error occurred:", error)
+    # Сервера тг часто тупят при поллинге и кидают ошибки. У меня была 1 раз, бот не лег
+    return True
 
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.get_event_loop_policy().get_event_loop().create_task(db.initialize())
+    executor.start_polling(dispatcher=dp, skip_updates=True)
