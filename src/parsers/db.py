@@ -7,7 +7,6 @@ from psycopg import Error
 class DataBase:
 
     def __init__(self):
-        self.conninfo = f'host=ep-twilight-butterfly-537431.us-east-2.aws.neon.tech port={5432} dbname=botdb user=root password=z0iqhd5UCsnv'
         self.__pool = psycopg_pool.AsyncConnectionPool(conninfo=config.conninfo, open=False)
 
     def clear_db(self):
